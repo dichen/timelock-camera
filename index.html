@@ -52,6 +52,7 @@
   /* Keep controls compact */
   .controls { margin-top: 8px; }
   .btnWide { flex: 1 1 auto; }
+  .btnBlue { flex: 1 1 auto; color:#6495ed; }
   .status { margin-top: 8px; }
 </style>
 </head>
@@ -79,6 +80,14 @@
       <canvas id="canvas" style="display:none;"></canvas>
     </div>
 
+    <!-- ACTION BUTTONS -->
+    <div class="row controls">
+      <button id="start" class="btnWide">Start Camera</button>
+      <button id="snap" class="btnBlue" disabled>Take Photo</button>
+      <button id="switch" class="btnWide" disabled>Switch Camera</button>
+      <button id="clear" class="btnWide">Clear</button>
+    </div>
+
     <!-- PRESETS -->
     <div class="row">
       <button class="btnWide" data-preset="1">1 min</button>
@@ -93,14 +102,6 @@
       <span class="muted">h</span>
       <select id="mins" aria-label="Minutes"></select>
       <span class="muted">m</span>
-    </div>
-
-    <!-- ACTION BUTTONS -->
-    <div class="row controls">
-      <button id="start" class="btnWide">Start Camera</button>
-      <button id="switch" class="btnWide" disabled>Switch Camera</button>
-      <button id="snap" class="btnWide" disabled>Take Photo</button>
-      <button id="clear" class="btnWide">Clear</button>
     </div>
 
     <p id="status" class="muted status"></p>
