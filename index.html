@@ -14,35 +14,49 @@
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .muted { color: #666; }
     .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin-top: 12px; max-width: 540px; }
-    .big { font-size: 18px; font-weight: 600; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid #ddd; }
     .danger { border-color: #f2b8b5; background: #fff5f5; }
     .ok { border-color: #b8e6c8; background: #f5fff8; }
+    .mutedpill { color:#666; }
+    .label { color:#666; font-size: 14px; }
+    .preset-btn { padding: 8px 12px; font-size: 14px; }
+    .preset-active { border-color: #999; }
   </style>
 </head>
 <body>
   <h2>Time-Locked Camera (Prototype)</h2>
-  <p class="muted">Take a photo and hide it until the unlock time. Survives reload/refresh via IndexedDB.</p>
+  <p class="muted">Take a photo and hide it until the unlock time. Persists across reload/refresh via IndexedDB.</p>
 
   <div class="card">
     <div class="row">
-      <label class="muted">Delay:</label>
-      <select id="delay">
-        <option value="3600000" selected>1 hour</option>
-        <option value="60000">1 minute (test)</option>
-        <option value="300000">5 minutes</option>
-        <option value="900000">15 minutes</option>
-      </select>
+      <span class="label">Delay presets:</span>
+      <button class="preset-btn" data-preset-min="1" id="p1">1 min</button>
+      <button class="preset-btn" data-preset-min="10" id="p10">10 min</button>
+      <button class="preset-btn" data-preset-min="30" id="p30">30 min</button>
+      <button class="preset-btn" data-preset-min="60" id="p60">1 hour</button>
+    </div>
 
+    <div class="row">
+      <span class="label">Custom delay:</span>
+
+      <select id="hours" aria-label="Hours"></select>
+      <span class="label">hour(s)</span>
+
+      <select id="mins" aria-label="Minutes"></select>
+      <span class="label">min(s)</span>
+    </div>
+
+    <div class="row">
       <button id="start">Start Camera</button>
+      <button id="switch" disabled>Switch Camera (Back)</button>
       <button id="snap" disabled>Take Photo</button>
       <button id="clear">Clear Stored Photo</button>
     </div>
 
     <div class="row" style="margin-top:8px;">
-      <span id="lockState" class="pill muted">No photo stored</span>
-      <span id="countdown" class="pill muted mono">--:--:--</span>
+      <span id="lockState" class="pill mutedpill">No photo stored</span>
+      <span id="countdown" class="pill mutedpill mono">--:--:--</span>
     </div>
 
     <p id="status" class="muted" style="margin-top:10px;"></p>
@@ -54,30 +68,23 @@
 
 <script>
 /**
- * Storage model (IndexedDB):
- * - "photoDataUrl": string (base64 data URL jpeg)
- * - "unlockAt": number (epoch ms)
- * - "createdAt": number (epoch ms)
- *
- * This persists across refresh/reload and PWA relaunch, assuming the browser does not clear site data.
+ * IndexedDB storage:
+ * - photoDataUrl: string (jpeg data URL)
+ * - unlockAt: number (epoch ms)
+ * - createdAt: number (epoch ms)
  */
 
-const dbName = "time_lock_db_v1";
+const dbName = "time_lock_db_v3";
 const storeName = "kv";
 
-// Basic IndexedDB KV helpers
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(dbName, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      db.createObjectStore(storeName);
-    };
+    req.onupgradeneeded = () => req.result.createObjectStore(storeName);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
-
 async function idbSet(key, val) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -87,7 +94,6 @@ async function idbSet(key, val) {
     tx.onerror = () => reject(tx.error);
   });
 }
-
 async function idbGet(key) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -97,7 +103,6 @@ async function idbGet(key) {
     req.onerror = () => reject(req.error);
   });
 }
-
 async function idbDel(key) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -118,11 +123,26 @@ const lockStateEl = $("lockState");
 const countdownEl = $("countdown");
 const snapBtn = $("snap");
 const startBtn = $("start");
+const switchBtn = $("switch");
+const hoursSel = $("hours");
+const minsSel = $("mins");
 
 let stream = null;
 let tickTimer = null;
 
+// Camera selection state
+let desiredFacing = "environment";
+let deviceMap = { user: null, environment: null };
+
+// Preset buttons
+const presetButtons = Array.from(document.querySelectorAll("button[data-preset-min]"));
+
 function setStatus(msg) { statusEl.textContent = msg; }
+
+function setLockPill(text, kind) {
+  lockStateEl.textContent = text;
+  lockStateEl.className = "pill " + (kind === "danger" ? "danger" : kind === "ok" ? "ok" : "mutedpill");
+}
 
 function formatDuration(ms) {
   if (ms < 0) ms = 0;
@@ -133,6 +153,48 @@ function formatDuration(ms) {
   return `${hh}:${mm}:${ss}`;
 }
 
+function populateTimeDropdowns() {
+  // Hours: 0..23, default 1
+  for (let h = 0; h <= 23; h++) {
+    const opt = document.createElement("option");
+    opt.value = String(h);
+    opt.textContent = String(h);
+    hoursSel.appendChild(opt);
+  }
+  hoursSel.value = "1";
+
+  // Minutes: 0..59, default 0
+  for (let m = 0; m <= 59; m++) {
+    const opt = document.createElement("option");
+    opt.value = String(m);
+    opt.textContent = String(m).padStart(2, "0");
+    minsSel.appendChild(opt);
+  }
+  minsSel.value = "0";
+}
+
+function setDelayFromMinutes(totalMinutes) {
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  hoursSel.value = String(h);
+  minsSel.value = String(m);
+  updatePresetHighlight();
+}
+
+function buildDelayMs() {
+  const h = Number(hoursSel.value);
+  const m = Number(minsSel.value);
+  return (h * 60 + m) * 60 * 1000;
+}
+
+function updatePresetHighlight() {
+  const totalMinutes = Number(hoursSel.value) * 60 + Number(minsSel.value);
+  presetButtons.forEach(btn => {
+    const presetMin = Number(btn.getAttribute("data-preset-min"));
+    btn.classList.toggle("preset-active", presetMin === totalMinutes);
+  });
+}
+
 async function getStored() {
   const unlockAt = await idbGet("unlockAt");
   const photoDataUrl = await idbGet("photoDataUrl");
@@ -140,16 +202,9 @@ async function getStored() {
   return { unlockAt, photoDataUrl, createdAt };
 }
 
-function setLockPill(state, kind) {
-  lockStateEl.textContent = state;
-  lockStateEl.className = "pill " + (kind === "danger" ? "danger" : kind === "ok" ? "ok" : "muted");
-}
-
-// Render (called every second to update countdown)
 async function render() {
   const { unlockAt, photoDataUrl, createdAt } = await getStored();
 
-  // No stored photo
   if (!unlockAt || !photoDataUrl) {
     img.style.display = "none";
     countdownEl.textContent = "--:--:--";
@@ -162,39 +217,21 @@ async function render() {
   const msLeft = unlockAt - now;
 
   if (msLeft > 0) {
-    // Locked
     img.style.display = "none";
     countdownEl.textContent = formatDuration(msLeft);
     setLockPill("Locked", "danger");
+
     const unlockStr = new Date(unlockAt).toLocaleString();
     const createdStr = createdAt ? new Date(createdAt).toLocaleString() : "—";
-    setStatus(`Photo is locked. Created: ${createdStr}. Unlocks at: ${unlockStr}. (Reload/refresh is safe.)`);
+    setStatus(`Photo is locked. Created: ${createdStr}. Unlocks at: ${unlockStr}.`);
   } else {
-    // Unlocked
     img.src = photoDataUrl;
     img.style.display = "block";
     countdownEl.textContent = "00:00:00";
     setLockPill("Unlocked", "ok");
+
     const unlockStr = new Date(unlockAt).toLocaleString();
     setStatus(`Unlocked. Unlock time was: ${unlockStr}.`);
-  }
-}
-
-async function startCamera() {
-  try {
-    // Use environment camera by default
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment" },
-      audio: false
-    });
-
-    video.srcObject = stream;
-    video.style.display = "block";
-    snapBtn.disabled = false;
-    setStatus("Camera started. Tap 'Take Photo'.");
-  } catch (e) {
-    console.error(e);
-    setStatus("Camera permission denied or unavailable. On iPhone: open via HTTPS in Safari (GitHub Pages works).");
   }
 }
 
@@ -205,12 +242,87 @@ function stopCameraIfRunning() {
   }
   video.style.display = "none";
   snapBtn.disabled = true;
+  switchBtn.disabled = true;
+}
+
+async function refreshDeviceMap() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === "videoinput");
+    let front = null, back = null;
+
+    for (const cam of cams) {
+      const label = (cam.label || "").toLowerCase();
+      if (!front && (label.includes("front") || label.includes("user") || label.includes("facetime"))) front = cam.deviceId;
+      if (!back && (label.includes("back") || label.includes("rear") || label.includes("environment"))) back = cam.deviceId;
+    }
+
+    if ((!front || !back) && cams.length >= 2) {
+      back = back || cams[0].deviceId;
+      front = front || cams[cams.length - 1].deviceId;
+    }
+
+    deviceMap.user = front;
+    deviceMap.environment = back;
+  } catch (_) {}
+}
+
+async function startCameraWithFacing(facing) {
+  desiredFacing = facing;
+  stopCameraIfRunning();
+
+  const tryGetUserMedia = async (constraints) => {
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    video.style.display = "block";
+    snapBtn.disabled = false;
+    switchBtn.disabled = false;
+  };
+
+  const deviceId = deviceMap[facing];
+
+  try {
+    if (deviceId) {
+      await tryGetUserMedia({ video: { deviceId: { exact: deviceId } }, audio: false });
+    } else {
+      await tryGetUserMedia({ video: { facingMode: { ideal: facing } }, audio: false });
+    }
+
+    await refreshDeviceMap();
+    switchBtn.textContent = `Switch Camera (${desiredFacing === "environment" ? "Back" : "Front"})`;
+    setStatus(`Camera started (${desiredFacing === "environment" ? "Back" : "Front"}). Tap 'Take Photo'.`);
+  } catch (e1) {
+    try {
+      await tryGetUserMedia({ video: { facingMode: { exact: facing } }, audio: false });
+      await refreshDeviceMap();
+      switchBtn.textContent = `Switch Camera (${desiredFacing === "environment" ? "Back" : "Front"})`;
+      setStatus(`Camera started (${desiredFacing === "environment" ? "Back" : "Front"}). Tap 'Take Photo'.`);
+    } catch (e2) {
+      console.error(e1, e2);
+      setStatus("Camera unavailable or permission denied. Ensure HTTPS + Safari and Camera permission is allowed.");
+      stopCameraIfRunning();
+    }
+  }
+}
+
+async function startCamera() {
+  await startCameraWithFacing(desiredFacing);
+}
+
+async function switchCamera() {
+  const next = (desiredFacing === "environment") ? "user" : "environment";
+  await startCameraWithFacing(next);
 }
 
 async function takePhoto() {
   if (!stream) return;
 
-  // Capture current video frame
+  const delayMs = buildDelayMs();
+  if (delayMs <= 0) {
+    setStatus("Delay must be at least 1 minute (or set a non-zero value).");
+    return;
+  }
+
   const w = video.videoWidth || 1280;
   const h = video.videoHeight || 720;
   canvas.width = w;
@@ -218,10 +330,8 @@ async function takePhoto() {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(video, 0, 0, w, h);
 
-  // Store as JPEG data URL (prototype convenience)
   const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
 
-  const delayMs = Number($("delay").value);
   const now = Date.now();
   const unlockAt = now + delayMs;
 
@@ -241,23 +351,44 @@ async function clearAll() {
   await render();
 }
 
-// Wire up buttons
-$("start").addEventListener("click", startCamera);
-$("snap").addEventListener("click", takePhoto);
+// Preset handlers
+presetButtons.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const presetMin = Number(btn.getAttribute("data-preset-min"));
+    setDelayFromMinutes(presetMin);
+    setStatus(`Delay set to preset: ${presetMin} minute(s).`);
+  });
+});
+
+// Update preset highlight when dropdown changes
+hoursSel.addEventListener("change", updatePresetHighlight);
+minsSel.addEventListener("change", updatePresetHighlight);
+
+// Wire up main buttons
+startBtn.addEventListener("click", startCamera);
+switchBtn.addEventListener("click", switchCamera);
+snapBtn.addEventListener("click", takePhoto);
 $("clear").addEventListener("click", clearAll);
 
-// Ensure we render immediately on load and keep countdown accurate
+// Init
 (async () => {
-  await render();
-  if (tickTimer) clearInterval(tickTimer);
-  tickTimer = setInterval(render, 1000); // live countdown every second
-})();
+  populateTimeDropdowns();
+  // Default to 1 hour (preset)
+  setDelayFromMinutes(60);
 
-// When page becomes visible again (after app switching), re-render immediately
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) render();
-});
+  await render();
+
+  if (tickTimer) clearInterval(tickTimer);
+  tickTimer = setInterval(render, 1000);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) render();
+  });
+
+  switchBtn.disabled = true;
+})();
 </script>
 </body>
 </html>
+
 
