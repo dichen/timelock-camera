@@ -6,24 +6,24 @@
 <title>Time-Locked Camera</title>
 
 <style>
-body { font-family: system-ui,-apple-system,Segoe UI,Roboto; margin:16px; }
-video, img { width:100%; max-width:520px; border-radius:12px; background:#eee; }
-button, select { padding:10px 14px; border-radius:10px; border:1px solid #ccc; margin:6px 6px 6px 0; font-size:16px; }
-.row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-.card { border:1px solid #e5e5e5; border-radius:12px; padding:12px; max-width:540px; }
-.muted { color:#666; }
-.pill { padding:4px 10px; border-radius:999px; border:1px solid #ddd; }
-.danger { background:#fff5f5; border-color:#f2b8b5; }
-.ok { background:#f5fff8; border-color:#b8e6c8; }
-.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-.masked { filter: blur(2px); }
+  body { font-family: system-ui,-apple-system,Segoe UI,Roboto; margin:16px; }
+  video, img { width:100%; max-width:520px; border-radius:12px; background:#eee; }
+  button, select { padding:10px 14px; border-radius:10px; border:1px solid #ccc; margin:6px 6px 6px 0; font-size:16px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .card { border:1px solid #e5e5e5; border-radius:12px; padding:12px; max-width:540px; }
+  .muted { color:#666; }
+  .pill { padding:4px 10px; border-radius:999px; border:1px solid #ddd; }
+  .danger { background:#fff5f5; border-color:#f2b8b5; }
+  .ok { background:#f5fff8; border-color:#b8e6c8; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .masked { filter: blur(2px); }
 </style>
 </head>
 
 <body>
-<h2>Time-Locked Camera v0.5</h2>
+<h2>Time-Locked Camera v0.6</h2>
 <p class="muted">
-This app takes a picture and lock it for a preset time period
+  This app locks the photo for a preset time period.
 </p>
 
 <div class="card">
@@ -35,8 +35,8 @@ This app takes a picture and lock it for a preset time period
   </div>
 
   <div class="row">
-    <select id="hours"></select> h
-    <select id="mins"></select> m
+    <select id="hours" aria-label="Hours"></select> h
+    <select id="mins" aria-label="Minutes"></select> m
   </div>
 
   <div class="row">
@@ -55,112 +55,279 @@ This app takes a picture and lock it for a preset time period
 
   <video id="video" autoplay playsinline muted style="display:none"></video>
   <canvas id="canvas" style="display:none"></canvas>
-  <img id="photo" style="display:none" />
+  <img id="photo" alt="Preview" style="display:none" />
 </div>
 
 <script>
 /* ---------- IndexedDB ---------- */
-const DB = "timelock_v1", STORE = "kv";
-const openDB = () => new Promise(r => {
-  const req = indexedDB.open(DB,1);
+const DB = "timelock_v2", STORE = "kv";
+
+const openDB = () => new Promise((resolve, reject) => {
+  const req = indexedDB.open(DB, 1);
   req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-  req.onsuccess = () => r(req.result);
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
 });
-const get = async k => (await openDB()).transaction(STORE).objectStore(STORE).get(k);
-const set = async (k,v) => { const db=await openDB(); const t=db.transaction(STORE,"readwrite"); t.objectStore(STORE).put(v,k); };
-const del = async k => { const db=await openDB(); const t=db.transaction(STORE,"readwrite"); t.objectStore(STORE).delete(k); };
+
+async function idbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, val) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(val, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbDel(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
 
 /* ---------- UI ---------- */
 const $ = id => document.getElementById(id);
-const video=$("video"), canvas=$("canvas"), img=$("photo");
-const stateEl=$("state"), cdEl=$("countdown"), statusEl=$("status");
+const video = $("video");
+const canvas = $("canvas");
+const img = $("photo");
+const stateEl = $("state");
+const cdEl = $("countdown");
+const statusEl = $("status");
 
-/* ---------- Time ---------- */
-const fmt = ms => {
-  ms=Math.max(0,ms);
-  const s=Math.floor(ms/1000);
-  return [Math.floor(s/3600),Math.floor(s/60)%60,s%60].map(v=>String(v).padStart(2,"0")).join(":");
-};
+/* ---------- Time formatting ---------- */
+function fmt(ms) {
+  ms = Math.max(0, ms);
+  const s = Math.floor(ms / 1000);
+  const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((s / 60) % 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
 
-/* ---------- Mosaic ---------- */
-async function mosaic(data){
-  const im=new Image(); im.src=data; await im.decode();
-  const b=26, w=im.width, h=im.height;
-  const s=document.createElement("canvas");
-  s.width=Math.max(1,w/b); s.height=Math.max(1,h/b);
-  s.getContext("2d").drawImage(im,0,0,s.width,s.height);
-  const o=document.createElement("canvas");
-  o.width=w; o.height=h;
-  const c=o.getContext("2d");
-  c.imageSmoothingEnabled=false;
-  c.drawImage(s,0,0,w,h);
-  return o.toDataURL("image/jpeg",0.8);
+/* ---------- Safe image show/hide (prevents broken icon on iOS) ---------- */
+function hideImg() {
+  img.style.display = "none";
+  img.className = "";
+  // Setting src to a valid tiny image avoids iOS showing a broken icon for empty src.
+  img.src = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+}
+function showImg(src, masked) {
+  img.src = src;
+  img.style.display = "block";
+  img.className = masked ? "masked" : "";
+}
+
+/* ---------- Mosaic (memory-safe for iOS) ----------
+   - Stores full photo as-is
+   - Generates masked preview at reduced resolution to avoid iOS decode/render failures
+*/
+const MOSAIC_BLOCK_PX = 26;
+const MASK_MAX_DIM = 1024; // key fix for iPhone: keep masked preview small enough to reliably render
+
+function loadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = reject;
+    im.src = dataUrl;
+  });
+}
+
+async function mosaicPreview(fullDataUrl) {
+  const im = await loadImage(fullDataUrl);
+  const srcW = im.naturalWidth || im.width;
+  const srcH = im.naturalHeight || im.height;
+
+  // Downscale for preview (reduce memory)
+  const scale = Math.min(1, MASK_MAX_DIM / Math.max(srcW, srcH));
+  const outW = Math.max(1, Math.round(srcW * scale));
+  const outH = Math.max(1, Math.round(srcH * scale));
+
+  // First, draw scaled image to a working canvas
+  const work = document.createElement("canvas");
+  work.width = outW;
+  work.height = outH;
+  const wctx = work.getContext("2d");
+  wctx.drawImage(im, 0, 0, outW, outH);
+
+  // Create tiny canvas for pixel blocks
+  const tinyW = Math.max(1, Math.floor(outW / MOSAIC_BLOCK_PX));
+  const tinyH = Math.max(1, Math.floor(outH / MOSAIC_BLOCK_PX));
+
+  const tiny = document.createElement("canvas");
+  tiny.width = tinyW;
+  tiny.height = tinyH;
+
+  const tctx = tiny.getContext("2d");
+  tctx.imageSmoothingEnabled = true;
+  tctx.drawImage(work, 0, 0, outW, outH, 0, 0, tinyW, tinyH);
+
+  // Upscale tiny back to preview size with smoothing disabled (pixelation)
+  const out = document.createElement("canvas");
+  out.width = outW;
+  out.height = outH;
+
+  const octx = out.getContext("2d");
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(tiny, 0, 0, tinyW, tinyH, 0, 0, outW, outH);
+
+  // Export masked preview (smaller JPEG)
+  return out.toDataURL("image/jpeg", 0.82);
 }
 
 /* ---------- Camera ---------- */
-let stream=null, facing="environment";
-async function startCam(){
+let stream = null;
+let facing = "environment";
+
+function stopCam() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  video.style.display = "none";
+  $("snap").disabled = true;
+  $("switch").disabled = true;
+}
+
+async function startCam() {
   stopCam();
-  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing}});
-  video.srcObject=stream; video.style.display="block";
-  $("snap").disabled=false; $("switch").disabled=false;
-}
-function stopCam(){ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;} }
-
-/* ---------- Logic ---------- */
-async function render(){
-  const unlockAt=await get("unlockAt");
-  const full=await get("photo");
-  const mask=await get("mask");
-
-  if(!unlockAt||!full){
-    img.style.display="none"; cdEl.textContent="--:--:--";
-    stateEl.textContent="No photo"; return;
-  }
-
-  const left=unlockAt-Date.now();
-  if(left>0){
-    stateEl.textContent="Locked"; stateEl.className="pill danger";
-    cdEl.textContent=fmt(left);
-    img.src=mask; img.style.display="block"; img.className="masked";
-  }else{
-    stateEl.textContent="Unlocked"; stateEl.className="pill ok";
-    cdEl.textContent="00:00:00";
-    img.src=full; img.style.display="block"; img.className="";
-  }
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false });
+  video.srcObject = stream;
+  video.style.display = "block";
+  $("snap").disabled = false;
+  $("switch").disabled = false;
+  statusEl.textContent = "Camera started. Tap 'Take Photo'.";
 }
 
-$("start").onclick=startCam;
-$("switch").onclick=()=>{ facing=facing==="environment"?"user":"environment"; startCam(); };
+/* ---------- Render ---------- */
+async function render() {
+  const unlockAt = await idbGet("unlockAt");
+  const full = await idbGet("photo");
+  const mask = await idbGet("mask");
 
-$("snap").onclick=async()=>{
-  const delay=(+$("hours").value*60 + +$("mins").value)*60000;
-  if(delay<=0){ statusEl.textContent="Set delay first"; return; }
+  if (!unlockAt || !full) {
+    stateEl.textContent = "No photo";
+    stateEl.className = "pill muted";
+    cdEl.textContent = "--:--:--";
+    statusEl.textContent = "Ready. Start camera and take a photo.";
+    hideImg(); // critical fix: prevents broken image icon at startup
+    return;
+  }
 
-  canvas.width=video.videoWidth; canvas.height=video.videoHeight;
-  canvas.getContext("2d").drawImage(video,0,0);
-  const full=canvas.toDataURL("image/jpeg",0.92);
-  const mask=await mosaic(full);
+  const left = unlockAt - Date.now();
 
-  await set("photo",full);
-  await set("mask",mask);
-  await set("unlockAt",Date.now()+delay);
+  if (left > 0) {
+    stateEl.textContent = "Locked";
+    stateEl.className = "pill danger";
+    cdEl.textContent = fmt(left);
+    statusEl.textContent = "Masked preview shown during lock.";
+    if (mask) showImg(mask, true);
+    else hideImg();
+  } else {
+    stateEl.textContent = "Unlocked";
+    stateEl.className = "pill ok";
+    cdEl.textContent = "00:00:00";
+    statusEl.textContent = "Unlocked.";
+    showImg(full, false);
+  }
+}
 
-  stopCam(); render();
+/* ---------- Actions ---------- */
+$("start").onclick = async () => {
+  try { await startCam(); }
+  catch (e) {
+    statusEl.textContent = "Camera permission denied or unavailable. Ensure HTTPS and allow Camera access.";
+    stopCam();
+  }
 };
 
-$("clear").onclick=async()=>{
-  await del("photo"); await del("mask"); await del("unlockAt");
-  stopCam(); render();
+$("switch").onclick = async () => {
+  facing = (facing === "environment") ? "user" : "environment";
+  try { await startCam(); } catch (_) { /* handled by start */ }
+};
+
+$("snap").onclick = async () => {
+  const hours = String($("hours").value);
+  const mins = String($("mins").value);
+  const delayMin = (Number(hours) * 60) + Number(mins);
+  const delayMs = delayMin * 60000;
+
+  if (!delayMs || delayMs <= 0) {
+    statusEl.textContent = "Set a delay first (e.g., 1 min).";
+    return;
+  }
+  if (!stream) return;
+
+  // Capture full-res frame
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0);
+
+  const full = canvas.toDataURL("image/jpeg", 0.92);
+
+  // Generate masked preview (memory-safe)
+  let mask = null;
+  try { mask = await mosaicPreview(full); }
+  catch (_) { mask = null; }
+
+  await idbSet("photo", full);
+  await idbSet("mask", mask);
+  await idbSet("unlockAt", Date.now() + delayMs);
+
+  stopCam();
+  await render();
+};
+
+$("clear").onclick = async () => {
+  await idbDel("photo");
+  await idbDel("mask");
+  await idbDel("unlockAt");
+  stopCam();
+  await render();
 };
 
 /* ---------- Init ---------- */
-for(let i=0;i<24;i++) $("hours").add(new Option(i,i));
-for(let i=0;i<60;i++) $("mins").add(new Option(i,String(i).padStart(2,"0")));
-document.querySelectorAll("[data-preset]").forEach(b=>b.onclick=()=>{
-  const m=+b.dataset.preset; $("hours").value=Math.floor(m/60); $("mins").value=m%60;
-});
-setInterval(render,1000); render();
+(function init() {
+  // Populate selects with string values
+  for (let i = 0; i < 24; i++) $("hours").add(new Option(String(i), String(i)));
+  for (let i = 0; i < 60; i++) {
+    const v = String(i).padStart(2, "0");
+    $("mins").add(new Option(v, v));
+  }
+
+  // Default to 1 hour
+  $("hours").value = "1";
+  $("mins").value = "00";
+
+  // Presets (FIX: set mins value as "01"/"10"/etc to match option values)
+  document.querySelectorAll("[data-preset]").forEach(btn => {
+    btn.onclick = () => {
+      const total = Number(btn.dataset.preset);
+      const h = Math.floor(total / 60);
+      const m = total % 60;
+      $("hours").value = String(h);
+      $("mins").value = String(m).padStart(2, "0"); // critical fix
+      statusEl.textContent = `Delay set to ${total} minute(s).`;
+    };
+  });
+
+  hideImg(); // critical fix: avoid broken image placeholder on iOS
+  setInterval(render, 1000);
+  render();
+})();
 </script>
 </body>
 </html>
