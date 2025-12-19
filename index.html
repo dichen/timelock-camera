@@ -6,66 +6,109 @@
 <title>Time-Locked Camera</title>
 
 <style>
-  body { font-family: system-ui,-apple-system,Segoe UI,Roboto; margin:16px; }
-  video, img { width:100%; max-width:520px; border-radius:12px; background:#eee; }
-  button, select { padding:10px 14px; border-radius:10px; border:1px solid #ccc; margin:6px 6px 6px 0; font-size:16px; }
-  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-  .card { border:1px solid #e5e5e5; border-radius:12px; padding:12px; max-width:540px; }
+  body { font-family: system-ui,-apple-system,Segoe UI,Roboto; margin: 14px; }
   .muted { color:#666; }
-  .pill { padding:4px 10px; border-radius:999px; border:1px solid #ddd; }
+  .card { border:1px solid #e5e5e5; border-radius:14px; padding:12px; max-width:560px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button, select { padding:10px 14px; border-radius:12px; border:1px solid #ccc; font-size:16px; background:#fff; }
+  .pill { padding:6px 12px; border-radius:999px; border:1px solid #ddd; display:inline-block; }
   .danger { background:#fff5f5; border-color:#f2b8b5; }
   .ok { background:#f5fff8; border-color:#b8e6c8; }
-  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  /* Countdown emphasis */
+  .header {
+    margin-bottom: 10px;
+  }
+  .countdownBig {
+    font-size: 40px;
+    line-height: 1.1;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+  .topBar {
+    display:flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+
+  /* Media first (photo / live view) */
+  .mediaWrap {
+    margin-top: 10px;
+    margin-bottom: 10px;
+  }
+  video, img {
+    width: 100%;
+    max-width: 520px;
+    border-radius: 14px;
+    background: #eee;
+    display:block;
+  }
   .masked { filter: blur(2px); }
+
+  /* Keep controls compact */
+  .controls { margin-top: 8px; }
+  .btnWide { flex: 1 1 auto; }
+  .status { margin-top: 8px; }
 </style>
 </head>
 
 <body>
-<h2>Time-Locked Camera v0.6</h2>
-<p class="muted">
-  This app locks the photo for a preset time period. <br> A masked photo preview will be shown during the lock period
-</p>
-  <p class="muted">Applications:<br>
-  1. Time release combination lock - you can randomly set up a new combination code without watching it, and then use your phone or laptop to take a photo using this app and it can lock the items you want for a preset time delay<br>
-  2. Gameplay - Put the numbers or answers on a paper and take a photo. Players can not see the answers until the time is up.
-  </p>
-  <p class="danger">Warning: it uses a local phone/OS time clock so it can be byapssed by adjusting the date/time. If this app is used for a self bondage play, please ensure that you always have backup method or an emergency contact to call for your own safety. </p>
+  <div class="card">
 
-<div class="card">
-  <div class="row">
-    <button data-preset="1">1 min</button>
-    <button data-preset="10">10 min</button>
-    <button data-preset="30">30 min</button>
-    <button data-preset="60">1 hour</button>
+    <!-- TOP: Countdown + State (always visible, no scrolling needed) -->
+    <div class="header">
+      <div class="countdownBig mono" id="countdown">--:--:--</div>
+      <div class="topBar">
+        <span id="state" class="pill">No photo</span>
+        <span class="pill muted mono" id="unlockAtLabel">Unlock at: —</span>
+      </div>
+      <p class="muted" style="margin:8px 0 0 0;">
+        v0.7 <br>
+        Warning: For casual use only. If used for self bondage play, always ensure you have backup method to unlock or emergency contact to call
+      </p>
+    </div>
+
+    <!-- MEDIA: Photo preview / Live camera view ABOVE buttons -->
+    <div class="mediaWrap">
+      <video id="video" autoplay playsinline muted style="display:none;"></video>
+      <img id="photo" alt="Preview" style="display:none;" />
+      <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+
+    <!-- PRESETS -->
+    <div class="row">
+      <button class="btnWide" data-preset="1">1 min</button>
+      <button class="btnWide" data-preset="10">10 min</button>
+      <button class="btnWide" data-preset="30">30 min</button>
+      <button class="btnWide" data-preset="60">1 hour</button>
+    </div>
+
+    <!-- DELAY -->
+    <div class="row controls">
+      <select id="hours" aria-label="Hours"></select>
+      <span class="muted">h</span>
+      <select id="mins" aria-label="Minutes"></select>
+      <span class="muted">m</span>
+    </div>
+
+    <!-- ACTION BUTTONS -->
+    <div class="row controls">
+      <button id="start" class="btnWide">Start Camera</button>
+      <button id="switch" class="btnWide" disabled>Switch Camera</button>
+      <button id="snap" class="btnWide" disabled>Take Photo</button>
+      <button id="clear" class="btnWide">Clear</button>
+    </div>
+
+    <p id="status" class="muted status"></p>
   </div>
-
-  <div class="row">
-    <select id="hours" aria-label="Hours"></select> h
-    <select id="mins" aria-label="Minutes"></select> m
-  </div>
-
-  <div class="row">
-    <button id="start">Start Camera</button>
-    <button id="switch" disabled>Switch Camera</button>
-    <button id="snap" disabled>Take Photo</button>
-    <button id="clear">Clear</button>
-  </div>
-
-  <div class="row">
-    <span id="state" class="pill muted">No photo</span>
-    <span id="countdown" class="pill mono">--:--:--</span>
-  </div>
-
-  <p id="status" class="muted"></p>
-
-  <video id="video" autoplay playsinline muted style="display:none"></video>
-  <canvas id="canvas" style="display:none"></canvas>
-  <img id="photo" alt="Preview" style="display:none" />
-</div>
 
 <script>
 /* ---------- IndexedDB ---------- */
-const DB = "timelock_v2", STORE = "kv";
+const DB = "timelock_v3", STORE = "kv";
 
 const openDB = () => new Promise((resolve, reject) => {
   const req = indexedDB.open(DB, 1);
@@ -110,6 +153,7 @@ const img = $("photo");
 const stateEl = $("state");
 const cdEl = $("countdown");
 const statusEl = $("status");
+const unlockAtLabel = $("unlockAtLabel");
 
 /* ---------- Time formatting ---------- */
 function fmt(ms) {
@@ -121,11 +165,10 @@ function fmt(ms) {
   return `${hh}:${mm}:${ss}`;
 }
 
-/* ---------- Safe image show/hide (prevents broken icon on iOS) ---------- */
+/* Prevent broken image icon on iOS */
 function hideImg() {
   img.style.display = "none";
   img.className = "";
-  // Setting src to a valid tiny image avoids iOS showing a broken icon for empty src.
   img.src = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
 }
 function showImg(src, masked) {
@@ -134,12 +177,9 @@ function showImg(src, masked) {
   img.className = masked ? "masked" : "";
 }
 
-/* ---------- Mosaic (memory-safe for iOS) ----------
-   - Stores full photo as-is
-   - Generates masked preview at reduced resolution to avoid iOS decode/render failures
-*/
+/* ---------- Mosaic (memory-safe) ---------- */
 const MOSAIC_BLOCK_PX = 26;
-const MASK_MAX_DIM = 1024; // key fix for iPhone: keep masked preview small enough to reliably render
+const MASK_MAX_DIM = 1024;
 
 function loadImage(dataUrl) {
   return new Promise((resolve, reject) => {
@@ -155,19 +195,15 @@ async function mosaicPreview(fullDataUrl) {
   const srcW = im.naturalWidth || im.width;
   const srcH = im.naturalHeight || im.height;
 
-  // Downscale for preview (reduce memory)
   const scale = Math.min(1, MASK_MAX_DIM / Math.max(srcW, srcH));
   const outW = Math.max(1, Math.round(srcW * scale));
   const outH = Math.max(1, Math.round(srcH * scale));
 
-  // First, draw scaled image to a working canvas
   const work = document.createElement("canvas");
   work.width = outW;
   work.height = outH;
-  const wctx = work.getContext("2d");
-  wctx.drawImage(im, 0, 0, outW, outH);
+  work.getContext("2d").drawImage(im, 0, 0, outW, outH);
 
-  // Create tiny canvas for pixel blocks
   const tinyW = Math.max(1, Math.floor(outW / MOSAIC_BLOCK_PX));
   const tinyH = Math.max(1, Math.floor(outH / MOSAIC_BLOCK_PX));
 
@@ -179,7 +215,6 @@ async function mosaicPreview(fullDataUrl) {
   tctx.imageSmoothingEnabled = true;
   tctx.drawImage(work, 0, 0, outW, outH, 0, 0, tinyW, tinyH);
 
-  // Upscale tiny back to preview size with smoothing disabled (pixelation)
   const out = document.createElement("canvas");
   out.width = outW;
   out.height = outH;
@@ -188,7 +223,6 @@ async function mosaicPreview(fullDataUrl) {
   octx.imageSmoothingEnabled = false;
   octx.drawImage(tiny, 0, 0, tinyW, tinyH, 0, 0, outW, outH);
 
-  // Export masked preview (smaller JPEG)
   return out.toDataURL("image/jpeg", 0.82);
 }
 
@@ -224,27 +258,39 @@ async function render() {
 
   if (!unlockAt || !full) {
     stateEl.textContent = "No photo";
-    stateEl.className = "pill muted";
+    stateEl.className = "pill";
     cdEl.textContent = "--:--:--";
+    unlockAtLabel.textContent = "Unlock at: —";
     statusEl.textContent = "Ready. Start camera and take a photo.";
-    hideImg(); // critical fix: prevents broken image icon at startup
+    hideImg();
     return;
   }
 
   const left = unlockAt - Date.now();
+  unlockAtLabel.textContent = "Unlock at: " + new Date(unlockAt).toLocaleString();
 
   if (left > 0) {
     stateEl.textContent = "Locked";
     stateEl.className = "pill danger";
     cdEl.textContent = fmt(left);
     statusEl.textContent = "Masked preview shown during lock.";
-    if (mask) showImg(mask, true);
-    else hideImg();
+
+    // During lock: show masked preview; hide live view if still open
+    if (video.style.display !== "none") {
+      // Keep live view visible while user is actively shooting; once shot, we stop cam anyway.
+    }
+    if (mask) {
+      video.style.display = "none";
+      showImg(mask, true);
+    } else {
+      hideImg();
+    }
   } else {
     stateEl.textContent = "Unlocked";
     stateEl.className = "pill ok";
     cdEl.textContent = "00:00:00";
     statusEl.textContent = "Unlocked.";
+    video.style.display = "none";
     showImg(full, false);
   }
 }
@@ -252,15 +298,15 @@ async function render() {
 /* ---------- Actions ---------- */
 $("start").onclick = async () => {
   try { await startCam(); }
-  catch (e) {
-    statusEl.textContent = "Camera permission denied or unavailable. Ensure HTTPS and allow Camera access.";
+  catch (_) {
+    statusEl.textContent = "Camera permission denied/unavailable. Ensure HTTPS and allow Camera access.";
     stopCam();
   }
 };
 
 $("switch").onclick = async () => {
   facing = (facing === "environment") ? "user" : "environment";
-  try { await startCam(); } catch (_) { /* handled by start */ }
+  try { await startCam(); } catch (_) {}
 };
 
 $("snap").onclick = async () => {
@@ -275,18 +321,14 @@ $("snap").onclick = async () => {
   }
   if (!stream) return;
 
-  // Capture full-res frame
   canvas.width = video.videoWidth || 1280;
   canvas.height = video.videoHeight || 720;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(video, 0, 0);
+  canvas.getContext("2d").drawImage(video, 0, 0);
 
   const full = canvas.toDataURL("image/jpeg", 0.92);
 
-  // Generate masked preview (memory-safe)
   let mask = null;
-  try { mask = await mosaicPreview(full); }
-  catch (_) { mask = null; }
+  try { mask = await mosaicPreview(full); } catch (_) { mask = null; }
 
   await idbSet("photo", full);
   await idbSet("mask", mask);
@@ -306,30 +348,28 @@ $("clear").onclick = async () => {
 
 /* ---------- Init ---------- */
 (function init() {
-  // Populate selects with string values
   for (let i = 0; i < 24; i++) $("hours").add(new Option(String(i), String(i)));
   for (let i = 0; i < 60; i++) {
     const v = String(i).padStart(2, "0");
     $("mins").add(new Option(v, v));
   }
 
-  // Default to 1 hour
+  // default 1 hour
   $("hours").value = "1";
   $("mins").value = "00";
 
-  // Presets (FIX: set mins value as "01"/"10"/etc to match option values)
   document.querySelectorAll("[data-preset]").forEach(btn => {
     btn.onclick = () => {
       const total = Number(btn.dataset.preset);
       const h = Math.floor(total / 60);
       const m = total % 60;
       $("hours").value = String(h);
-      $("mins").value = String(m).padStart(2, "0"); // critical fix
+      $("mins").value = String(m).padStart(2, "0");
       statusEl.textContent = `Delay set to ${total} minute(s).`;
     };
   });
 
-  hideImg(); // critical fix: avoid broken image placeholder on iOS
+  hideImg();
   setInterval(render, 1000);
   render();
 })();
