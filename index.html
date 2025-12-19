@@ -18,6 +18,7 @@
     .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid #ddd; }
     .danger { border-color: #f2b8b5; background: #fff5f5; }
     .ok { border-color: #b8e6c8; background: #f5fff8; }
+    .warn { border-color: #f5d37a; background: #fffaf0; }
     .mutedpill { color:#666; }
     .label { color:#666; font-size: 14px; }
     .preset-btn { padding: 8px 12px; font-size: 14px; }
@@ -26,15 +27,17 @@
 </head>
 <body>
   <h2>Time-Locked Camera (Prototype)</h2>
-  <p class="muted">Take a photo and hide it until the unlock time. Persists across reload/refresh via IndexedDB.</p>
+  <p class="muted">
+    Lock/unlock is based on internet time. If time cannot be verified (offline), the countdown pauses and stays locked.
+  </p>
 
   <div class="card">
     <div class="row">
       <span class="label">Delay presets:</span>
-      <button class="preset-btn" data-preset-min="1" id="p1">1 min</button>
-      <button class="preset-btn" data-preset-min="10" id="p10">10 min</button>
-      <button class="preset-btn" data-preset-min="30" id="p30">30 min</button>
-      <button class="preset-btn" data-preset-min="60" id="p60">1 hour</button>
+      <button class="preset-btn" data-preset-min="1">1 min</button>
+      <button class="preset-btn" data-preset-min="10">10 min</button>
+      <button class="preset-btn" data-preset-min="30">30 min</button>
+      <button class="preset-btn" data-preset-min="60">1 hour</button>
     </div>
 
     <div class="row">
@@ -57,6 +60,7 @@
     <div class="row" style="margin-top:8px;">
       <span id="lockState" class="pill mutedpill">No photo stored</span>
       <span id="countdown" class="pill mutedpill mono">--:--:--</span>
+      <span id="timeState" class="pill mutedpill">Time: checking…</span>
     </div>
 
     <p id="status" class="muted" style="margin-top:10px;"></p>
@@ -70,11 +74,17 @@
 /**
  * IndexedDB storage:
  * - photoDataUrl: string (jpeg data URL)
- * - unlockAt: number (epoch ms)
- * - createdAt: number (epoch ms)
+ * - unlockAtServer: number (epoch ms, based on internet time)
+ * - createdAtServer: number (epoch ms)
+ *
+ * Time sync (in-memory only; recomputed on reload):
+ * - offsetMs: serverNowMs - Date.now()
+ * - lastSyncLocalMs: Date.now() when we last successfully synced
+ *
+ * Fail-safe: if time sync is stale/offline, countdown pauses and unlock cannot occur.
  */
 
-const dbName = "time_lock_db_v3";
+const dbName = "time_lock_db_v4";
 const storeName = "kv";
 
 function openDB() {
@@ -121,27 +131,46 @@ const img = $("photo");
 const statusEl = $("status");
 const lockStateEl = $("lockState");
 const countdownEl = $("countdown");
+const timeStateEl = $("timeState");
 const snapBtn = $("snap");
 const startBtn = $("start");
 const switchBtn = $("switch");
 const hoursSel = $("hours");
 const minsSel = $("mins");
 
+// Preset buttons
+const presetButtons = Array.from(document.querySelectorAll("button[data-preset-min]"));
+
 let stream = null;
-let tickTimer = null;
 
 // Camera selection state
 let desiredFacing = "environment";
 let deviceMap = { user: null, environment: null };
 
-// Preset buttons
-const presetButtons = Array.from(document.querySelectorAll("button[data-preset-min]"));
+// Time sync state
+let offsetMs = null;              // serverNow - localNow
+let lastSyncLocalMs = 0;          // local ms at last successful sync
+let lastServerNowEstimateMs = 0;  // estimated server now (for freeze transition)
+let frozenRemainingMs = null;     // remaining time frozen when offline/stale
+
+// Tunables
+const TIME_URL = "https://timeapi.world/api/ip"; // public time service
+const SYNC_INTERVAL_MS = 20000;                 // attempt every 20s
+const MAX_SYNC_AGE_MS = 60000;                  // if older than 60s => pause countdown
+const FETCH_TIMEOUT_MS = 4000;                  // 4s timeout for time fetch
+
+let renderTimer = null;
+let syncTimer = null;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
 function setLockPill(text, kind) {
   lockStateEl.textContent = text;
   lockStateEl.className = "pill " + (kind === "danger" ? "danger" : kind === "ok" ? "ok" : "mutedpill");
+}
+function setTimePill(text, kind) {
+  timeStateEl.textContent = text;
+  timeStateEl.className = "pill " + (kind === "warn" ? "warn" : "mutedpill");
 }
 
 function formatDuration(ms) {
@@ -154,23 +183,18 @@ function formatDuration(ms) {
 }
 
 function populateTimeDropdowns() {
-  // Hours: 0..23, default 1
   for (let h = 0; h <= 23; h++) {
     const opt = document.createElement("option");
     opt.value = String(h);
     opt.textContent = String(h);
     hoursSel.appendChild(opt);
   }
-  hoursSel.value = "1";
-
-  // Minutes: 0..59, default 0
   for (let m = 0; m <= 59; m++) {
     const opt = document.createElement("option");
     opt.value = String(m);
     opt.textContent = String(m).padStart(2, "0");
     minsSel.appendChild(opt);
   }
-  minsSel.value = "0";
 }
 
 function setDelayFromMinutes(totalMinutes) {
@@ -181,12 +205,6 @@ function setDelayFromMinutes(totalMinutes) {
   updatePresetHighlight();
 }
 
-function buildDelayMs() {
-  const h = Number(hoursSel.value);
-  const m = Number(minsSel.value);
-  return (h * 60 + m) * 60 * 1000;
-}
-
 function updatePresetHighlight() {
   const totalMinutes = Number(hoursSel.value) * 60 + Number(minsSel.value);
   presetButtons.forEach(btn => {
@@ -195,45 +213,86 @@ function updatePresetHighlight() {
   });
 }
 
+function buildDelayMs() {
+  const h = Number(hoursSel.value);
+  const m = Number(minsSel.value);
+  return (h * 60 + m) * 60 * 1000;
+}
+
 async function getStored() {
-  const unlockAt = await idbGet("unlockAt");
+  const unlockAtServer = await idbGet("unlockAtServer");
   const photoDataUrl = await idbGet("photoDataUrl");
-  const createdAt = await idbGet("createdAt");
-  return { unlockAt, photoDataUrl, createdAt };
+  const createdAtServer = await idbGet("createdAtServer");
+  return { unlockAtServer, photoDataUrl, createdAtServer };
 }
 
-async function render() {
-  const { unlockAt, photoDataUrl, createdAt } = await getStored();
+// ---- Time sync (no backend) ----
 
-  if (!unlockAt || !photoDataUrl) {
-    img.style.display = "none";
-    countdownEl.textContent = "--:--:--";
-    setLockPill("No photo stored", "muted");
-    setStatus("Take a photo to start the lock. Refreshing the page will not lose it.");
-    return;
+function isTimeFresh() {
+  return (offsetMs !== null) && (Date.now() - lastSyncLocalMs <= MAX_SYNC_AGE_MS);
+}
+
+function estimatedServerNowMs() {
+  if (offsetMs === null) return null;
+  return Date.now() + offsetMs;
+}
+
+async function fetchWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  const now = Date.now();
-  const msLeft = unlockAt - now;
+// Uses a public time service to compute offset.
+// We also use midpoint timing to slightly reduce network latency bias.
+async function syncTime() {
+  const t0 = Date.now();
+  try {
+    const data = await fetchWithTimeout(TIME_URL, FETCH_TIMEOUT_MS);
+    const t1 = Date.now();
 
-  if (msLeft > 0) {
-    img.style.display = "none";
-    countdownEl.textContent = formatDuration(msLeft);
-    setLockPill("Locked", "danger");
+    // Prefer utc_datetime for ms resolution, fallback to unixtime seconds.
+    let serverNowMs = null;
+    if (data && typeof data.utc_datetime === "string") {
+      const parsed = Date.parse(data.utc_datetime);
+      if (!Number.isNaN(parsed)) serverNowMs = parsed;
+    }
+    if (serverNowMs === null && data && typeof data.unixtime === "number") {
+      serverNowMs = data.unixtime * 1000;
+    }
+    if (serverNowMs === null) throw new Error("No usable time fields");
 
-    const unlockStr = new Date(unlockAt).toLocaleString();
-    const createdStr = createdAt ? new Date(createdAt).toLocaleString() : "—";
-    setStatus(`Photo is locked. Created: ${createdStr}. Unlocks at: ${unlockStr}.`);
+    // Approximate local time at response arrival as midpoint.
+    const localMidMs = t0 + Math.round((t1 - t0) / 2);
+    offsetMs = serverNowMs - localMidMs;
+    lastSyncLocalMs = Date.now();
+
+    // If we were frozen, unfreeze.
+    frozenRemainingMs = null;
+
+    return true;
+  } catch (e) {
+    // Do not clear offset immediately; we simply let it go stale.
+    return false;
+  }
+}
+
+function updateTimePill() {
+  if (isTimeFresh()) {
+    const age = Date.now() - lastSyncLocalMs;
+    setTimePill(`Time: verified (${Math.round(age/1000)}s ago)`, "muted");
   } else {
-    img.src = photoDataUrl;
-    img.style.display = "block";
-    countdownEl.textContent = "00:00:00";
-    setLockPill("Unlocked", "ok");
-
-    const unlockStr = new Date(unlockAt).toLocaleString();
-    setStatus(`Unlocked. Unlock time was: ${unlockStr}.`);
+    setTimePill("Time: not verified (offline) — paused", "warn");
   }
 }
+
+// ---- Camera helpers ----
 
 function stopCameraIfRunning() {
   if (stream) {
@@ -256,12 +315,10 @@ async function refreshDeviceMap() {
       if (!front && (label.includes("front") || label.includes("user") || label.includes("facetime"))) front = cam.deviceId;
       if (!back && (label.includes("back") || label.includes("rear") || label.includes("environment"))) back = cam.deviceId;
     }
-
     if ((!front || !back) && cams.length >= 2) {
       back = back || cams[0].deviceId;
       front = front || cams[cams.length - 1].deviceId;
     }
-
     deviceMap.user = front;
     deviceMap.environment = back;
   } catch (_) {}
@@ -306,6 +363,12 @@ async function startCameraWithFacing(facing) {
 }
 
 async function startCamera() {
+  // Require verified internet time to use the app (your requirement)
+  updateTimePill();
+  if (!isTimeFresh()) {
+    setStatus("Internet time is not verified. Reconnect to the internet; timer/camera use is blocked until time sync succeeds.");
+    return;
+  }
   await startCameraWithFacing(desiredFacing);
 }
 
@@ -314,7 +377,88 @@ async function switchCamera() {
   await startCameraWithFacing(next);
 }
 
+// ---- Main render loop ----
+
+async function render() {
+  const { unlockAtServer, photoDataUrl, createdAtServer } = await getStored();
+
+  updateTimePill();
+
+  // Track last estimate for freeze transition
+  if (isTimeFresh()) {
+    const est = estimatedServerNowMs();
+    if (est !== null) lastServerNowEstimateMs = est;
+  }
+
+  // No stored photo
+  if (!unlockAtServer || !photoDataUrl) {
+    img.style.display = "none";
+    countdownEl.textContent = "--:--:--";
+    setLockPill("No photo stored", "muted");
+    setStatus(isTimeFresh()
+      ? "Ready. Choose delay, start camera, take photo. Refreshing the page will not lose the stored photo."
+      : "Offline. This app requires internet time verification. Countdown (if any) will pause until verified."
+    );
+    return;
+  }
+
+  // Stored photo exists
+  const fresh = isTimeFresh();
+
+  if (!fresh) {
+    // Freeze countdown and remain locked until time is verified again
+    img.style.display = "none";
+    setLockPill("Locked (Paused)", "danger");
+
+    if (frozenRemainingMs === null) {
+      // Freeze remaining time using last known estimated server time
+      const base = lastServerNowEstimateMs || (unlockAtServer - 1); // safe fallback (still locked)
+      frozenRemainingMs = unlockAtServer - base;
+      if (frozenRemainingMs < 0) frozenRemainingMs = 0;
+    }
+    countdownEl.textContent = formatDuration(frozenRemainingMs);
+
+    const unlockStr = new Date(unlockAtServer).toLocaleString();
+    const createdStr = createdAtServer ? new Date(createdAtServer).toLocaleString() : "—";
+    setStatus(`Photo is locked but time cannot be verified (offline). Countdown is paused. Created: ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
+    return;
+  }
+
+  // Fresh time: countdown runs using estimated server time
+  const serverNow = estimatedServerNowMs();
+  const msLeft = unlockAtServer - serverNow;
+
+  if (msLeft > 0) {
+    img.style.display = "none";
+    frozenRemainingMs = null;
+    countdownEl.textContent = formatDuration(msLeft);
+    setLockPill("Locked", "danger");
+
+    const unlockStr = new Date(unlockAtServer).toLocaleString();
+    const createdStr = createdAtServer ? new Date(createdAtServer).toLocaleString() : "—";
+    setStatus(`Photo is locked. Created (server time): ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
+  } else {
+    // Unlocked (only allowed when time is verified)
+    img.src = photoDataUrl;
+    img.style.display = "block";
+    frozenRemainingMs = null;
+    countdownEl.textContent = "00:00:00";
+    setLockPill("Unlocked", "ok");
+
+    const unlockStr = new Date(unlockAtServer).toLocaleString();
+    setStatus(`Unlocked (time verified). Unlock time (server time): ${unlockStr}.`);
+  }
+}
+
+// ---- Actions ----
+
 async function takePhoto() {
+  // Require verified internet time to start the timer (your requirement)
+  updateTimePill();
+  if (!isTimeFresh()) {
+    setStatus("Cannot take/lock a photo while offline. Reconnect to the internet so time can be verified.");
+    return;
+  }
   if (!stream) return;
 
   const delayMs = buildDelayMs();
@@ -323,21 +467,22 @@ async function takePhoto() {
     return;
   }
 
+  // Capture frame
   const w = video.videoWidth || 1280;
   const h = video.videoHeight || 720;
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext("2d");
   ctx.drawImage(video, 0, 0, w, h);
-
   const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
 
-  const now = Date.now();
-  const unlockAt = now + delayMs;
+  // Use server time estimate for lock start; because sync is fresh, this is anchored to internet time
+  const serverNow = estimatedServerNowMs();
+  const unlockAtServer = serverNow + delayMs;
 
   await idbSet("photoDataUrl", dataUrl);
-  await idbSet("unlockAt", unlockAt);
-  await idbSet("createdAt", now);
+  await idbSet("createdAtServer", serverNow);
+  await idbSet("unlockAtServer", unlockAtServer);
 
   stopCameraIfRunning();
   await render();
@@ -345,50 +490,67 @@ async function takePhoto() {
 
 async function clearAll() {
   await idbDel("photoDataUrl");
-  await idbDel("unlockAt");
-  await idbDel("createdAt");
+  await idbDel("unlockAtServer");
+  await idbDel("createdAtServer");
   stopCameraIfRunning();
+  frozenRemainingMs = null;
   await render();
 }
 
-// Preset handlers
+// ---- Wiring ----
+
 presetButtons.forEach(btn => {
   btn.addEventListener("click", () => {
     const presetMin = Number(btn.getAttribute("data-preset-min"));
     setDelayFromMinutes(presetMin);
-    setStatus(`Delay set to preset: ${presetMin} minute(s).`);
+    setStatus(`Delay set: ${presetMin} minute(s).`);
   });
 });
-
-// Update preset highlight when dropdown changes
 hoursSel.addEventListener("change", updatePresetHighlight);
 minsSel.addEventListener("change", updatePresetHighlight);
 
-// Wire up main buttons
 startBtn.addEventListener("click", startCamera);
 switchBtn.addEventListener("click", switchCamera);
 snapBtn.addEventListener("click", takePhoto);
 $("clear").addEventListener("click", clearAll);
 
-// Init
+// ---- Boot ----
+
 (async () => {
   populateTimeDropdowns();
-  // Default to 1 hour (preset)
-  setDelayFromMinutes(60);
+  setDelayFromMinutes(60); // default 1 hour
 
+  // First sync attempt immediately
+  setTimePill("Time: checking…", "warn");
+  await syncTime();
+  updateTimePill();
+
+  // Periodic sync attempt
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = setInterval(async () => {
+    await syncTime();
+    updateTimePill();
+  }, SYNC_INTERVAL_MS);
+
+  // 1s UI loop (countdown)
+  if (renderTimer) clearInterval(renderTimer);
+  renderTimer = setInterval(render, 1000);
   await render();
 
-  if (tickTimer) clearInterval(tickTimer);
-  tickTimer = setInterval(render, 1000);
-
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) render();
+  // Re-render on app resume
+  document.addEventListener("visibilitychange", async () => {
+    if (!document.hidden) {
+      await syncTime(); // opportunistic resync on resume
+      await render();
+    }
   });
 
+  // Switch disabled until camera is active
   switchBtn.disabled = true;
 })();
 </script>
 </body>
 </html>
+
 
 
