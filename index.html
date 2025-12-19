@@ -77,14 +77,14 @@
  * - unlockAtServer: number (epoch ms, based on internet time)
  * - createdAtServer: number (epoch ms)
  *
- * Time sync (in-memory only; recomputed on reload):
+ * Time sync:
  * - offsetMs: serverNowMs - Date.now()
  * - lastSyncLocalMs: Date.now() when we last successfully synced
  *
  * Fail-safe: if time sync is stale/offline, countdown pauses and unlock cannot occur.
  */
 
-const dbName = "time_lock_db_v4";
+const dbName = "time_lock_db_v5";
 const storeName = "kv";
 
 function openDB() {
@@ -150,14 +150,19 @@ let deviceMap = { user: null, environment: null };
 // Time sync state
 let offsetMs = null;              // serverNow - localNow
 let lastSyncLocalMs = 0;          // local ms at last successful sync
-let lastServerNowEstimateMs = 0;  // estimated server now (for freeze transition)
+let lastServerNowEstimateMs = 0;  // last good estimated server time (for freeze)
 let frozenRemainingMs = null;     // remaining time frozen when offline/stale
+let lastTimeSource = "";          // which URL last succeeded
 
 // Tunables
-const TIME_URL = "https://timeapi.world/api/ip"; // public time service
-const SYNC_INTERVAL_MS = 20000;                 // attempt every 20s
-const MAX_SYNC_AGE_MS = 60000;                  // if older than 60s => pause countdown
-const FETCH_TIMEOUT_MS = 4000;                  // 4s timeout for time fetch
+const TIME_URLS = [
+  "https://timeapi.world/api/ip",
+  "https://worldtimeapi.org/api/ip",
+  "https://worldtimeapi.org/api/timezone/Etc/UTC"
+];
+const SYNC_INTERVAL_MS = 20000;   // attempt every 20s
+const MAX_SYNC_AGE_MS = 60000;    // if older than 60s => pause countdown
+const FETCH_TIMEOUT_MS = 4000;    // 4s timeout for time fetch
 
 let renderTimer = null;
 let syncTimer = null;
@@ -249,44 +254,56 @@ async function fetchWithTimeout(url, timeoutMs) {
   }
 }
 
-// Uses a public time service to compute offset.
-// We also use midpoint timing to slightly reduce network latency bias.
+// Fallback-capable sync across multiple providers.
+// Uses midpoint timing to reduce latency bias.
 async function syncTime() {
-  const t0 = Date.now();
-  try {
-    const data = await fetchWithTimeout(TIME_URL, FETCH_TIMEOUT_MS);
-    const t1 = Date.now();
+  for (const url of TIME_URLS) {
+    const t0 = Date.now();
+    try {
+      const data = await fetchWithTimeout(url, FETCH_TIMEOUT_MS);
+      const t1 = Date.now();
 
-    // Prefer utc_datetime for ms resolution, fallback to unixtime seconds.
-    let serverNowMs = null;
-    if (data && typeof data.utc_datetime === "string") {
-      const parsed = Date.parse(data.utc_datetime);
-      if (!Number.isNaN(parsed)) serverNowMs = parsed;
+      let serverNowMs = null;
+
+      // Common fields across providers:
+      if (data && typeof data.utc_datetime === "string") {
+        const parsed = Date.parse(data.utc_datetime);
+        if (!Number.isNaN(parsed)) serverNowMs = parsed;
+      }
+      if (serverNowMs === null && data && typeof data.datetime === "string") {
+        const parsed = Date.parse(data.datetime);
+        if (!Number.isNaN(parsed)) serverNowMs = parsed;
+      }
+      if (serverNowMs === null && data && typeof data.unixtime === "number") {
+        serverNowMs = data.unixtime * 1000;
+      }
+      if (serverNowMs === null && data && typeof data.epoch === "number") {
+        serverNowMs = data.epoch * 1000;
+      }
+
+      if (serverNowMs === null) throw new Error("No usable time fields");
+
+      const localMidMs = t0 + Math.round((t1 - t0) / 2);
+      offsetMs = serverNowMs - localMidMs;
+      lastSyncLocalMs = Date.now();
+      lastTimeSource = url;
+
+      // If we were frozen, unfreeze.
+      frozenRemainingMs = null;
+
+      return true;
+    } catch (e) {
+      // Try next provider
     }
-    if (serverNowMs === null && data && typeof data.unixtime === "number") {
-      serverNowMs = data.unixtime * 1000;
-    }
-    if (serverNowMs === null) throw new Error("No usable time fields");
-
-    // Approximate local time at response arrival as midpoint.
-    const localMidMs = t0 + Math.round((t1 - t0) / 2);
-    offsetMs = serverNowMs - localMidMs;
-    lastSyncLocalMs = Date.now();
-
-    // If we were frozen, unfreeze.
-    frozenRemainingMs = null;
-
-    return true;
-  } catch (e) {
-    // Do not clear offset immediately; we simply let it go stale.
-    return false;
   }
+  return false;
 }
 
 function updateTimePill() {
   if (isTimeFresh()) {
     const age = Date.now() - lastSyncLocalMs;
-    setTimePill(`Time: verified (${Math.round(age/1000)}s ago)`, "muted");
+    const host = lastTimeSource ? new URL(lastTimeSource).host : "time service";
+    setTimePill(`Time: verified via ${host} (${Math.round(age/1000)}s ago)`, "muted");
   } else {
     setTimePill("Time: not verified (offline) — paused", "warn");
   }
@@ -363,10 +380,12 @@ async function startCameraWithFacing(facing) {
 }
 
 async function startCamera() {
-  // Require verified internet time to use the app (your requirement)
+  // User-gesture sync (more reliable on iOS PWA than background-only sync)
+  await syncTime();
   updateTimePill();
+
   if (!isTimeFresh()) {
-    setStatus("Internet time is not verified. Reconnect to the internet; timer/camera use is blocked until time sync succeeds.");
+    setStatus("Internet time is not verified. Please reconnect (Wi-Fi/cellular) and try again. Countdown stays paused until time sync succeeds.");
     return;
   }
   await startCameraWithFacing(desiredFacing);
@@ -384,7 +403,7 @@ async function render() {
 
   updateTimePill();
 
-  // Track last estimate for freeze transition
+  // Update last estimate when fresh
   if (isTimeFresh()) {
     const est = estimatedServerNowMs();
     if (est !== null) lastServerNowEstimateMs = est;
@@ -399,10 +418,11 @@ async function render() {
       ? "Ready. Choose delay, start camera, take photo. Refreshing the page will not lose the stored photo."
       : "Offline. This app requires internet time verification. Countdown (if any) will pause until verified."
     );
+    // Optionally disable Start Camera when stale; you asked internet required
+    // startBtn.disabled = !isTimeFresh();
     return;
   }
 
-  // Stored photo exists
   const fresh = isTimeFresh();
 
   if (!fresh) {
@@ -411,8 +431,7 @@ async function render() {
     setLockPill("Locked (Paused)", "danger");
 
     if (frozenRemainingMs === null) {
-      // Freeze remaining time using last known estimated server time
-      const base = lastServerNowEstimateMs || (unlockAtServer - 1); // safe fallback (still locked)
+      const base = lastServerNowEstimateMs || (unlockAtServer - 1);
       frozenRemainingMs = unlockAtServer - base;
       if (frozenRemainingMs < 0) frozenRemainingMs = 0;
     }
@@ -420,7 +439,7 @@ async function render() {
 
     const unlockStr = new Date(unlockAtServer).toLocaleString();
     const createdStr = createdAtServer ? new Date(createdAtServer).toLocaleString() : "—";
-    setStatus(`Photo is locked but time cannot be verified (offline). Countdown is paused. Created: ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
+    setStatus(`Photo is locked but time cannot be verified (offline). Countdown is paused. Created (server time): ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
     return;
   }
 
@@ -453,8 +472,10 @@ async function render() {
 // ---- Actions ----
 
 async function takePhoto() {
-  // Require verified internet time to start the timer (your requirement)
+  // Require verified internet time to start timer
+  await syncTime();
   updateTimePill();
+
   if (!isTimeFresh()) {
     setStatus("Cannot take/lock a photo while offline. Reconnect to the internet so time can be verified.");
     return;
@@ -520,12 +541,13 @@ $("clear").addEventListener("click", clearAll);
   populateTimeDropdowns();
   setDelayFromMinutes(60); // default 1 hour
 
-  // First sync attempt immediately
   setTimePill("Time: checking…", "warn");
+
+  // Initial sync attempt (may fail on iOS; user-gesture sync in Start/TakePhoto is the real fix)
   await syncTime();
   updateTimePill();
 
-  // Periodic sync attempt
+  // Periodic sync attempt (best-effort)
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = setInterval(async () => {
     await syncTime();
@@ -537,10 +559,10 @@ $("clear").addEventListener("click", clearAll);
   renderTimer = setInterval(render, 1000);
   await render();
 
-  // Re-render on app resume
+  // Opportunistic resync on resume
   document.addEventListener("visibilitychange", async () => {
     if (!document.hidden) {
-      await syncTime(); // opportunistic resync on resume
+      await syncTime();
       await render();
     }
   });
@@ -551,6 +573,3 @@ $("clear").addEventListener("click", clearAll);
 </script>
 </body>
 </html>
-
-
-
