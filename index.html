@@ -50,9 +50,8 @@
   .masked { filter: blur(2px); }
 
   /* Keep controls compact */
-  .controls { margin-top: 8px; }
+  .controls { margin-top: 8px; margin-bottom: 8px }
   .btnWide { flex: 1 1 auto; }
-  .btnBlue { flex: 1 1 auto; color:#6495ed; }
   .status { margin-top: 8px; }
 </style>
 </head>
@@ -79,7 +78,9 @@
     <!-- ACTION BUTTONS -->
     <div class="row controls">
       <button id="start" class="btnWide">Start Camera</button>
-      <button id="snap" class="btnBlue" disabled>Take Photo</button>
+      <button id="snap" class="btnWide" disabled>Take Photo</button>
+    </div>
+    <div class="row controls">
       <button id="switch" class="btnWide" disabled>Switch Camera</button>
       <button id="clear" class="btnWide">Clear</button>
     </div>
@@ -102,7 +103,7 @@
 
     <p id="status" class="muted status"></p>
     <p class="muted" style="margin:8px 0 0 0;">
-        version 0.7 <br>
+        version 0.8 <br>
         Warning: For casual use only. If used for self bondage play, always ensure you have backup method to unlock or emergency contact to call
       </p>
   </div>
