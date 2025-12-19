@@ -23,16 +23,15 @@
     .label { color:#666; font-size: 14px; }
     .preset-btn { padding: 8px 12px; font-size: 14px; }
     .preset-active { border-color: #999; }
-
-    /* purely cosmetic extra blur on the masked preview (the mosaic is also baked into the image) */
     .maskedPreview { filter: blur(2px); }
   </style>
 </head>
 <body>
-  <h2>Time-Locked Camera (Prototype) v0.3 </h2>
+  <h2>Time-Locked Camera (Prototype) v0.4</h2>
   <p class="muted">
-    Lock/unlock is based on internet time. If time cannot be verified (offline), the countdown pauses and stays locked.
-    During lock, a masked (mosaic) preview is shown so you can confirm framing without reading details.
+    Timer starts immediately using local clock. Server time is checked every 1 minute in the background to validate/unlock.
+    Temporary connection loss will not pause; timer pauses only after 3 consecutive failed checks.
+    During lock, a masked (mosaic) preview is shown.
   </p>
 
   <div class="card">
@@ -64,7 +63,7 @@
     <div class="row" style="margin-top:8px;">
       <span id="lockState" class="pill mutedpill">No photo stored</span>
       <span id="countdown" class="pill mutedpill mono">--:--:--</span>
-      <span id="timeState" class="pill mutedpill">Time: checking…</span>
+      <span id="timeState" class="pill mutedpill">Time: not checked yet</span>
     </div>
 
     <p id="status" class="muted" style="margin-top:10px;"></p>
@@ -72,27 +71,27 @@
     <video id="video" playsinline autoplay muted style="display:none; margin-top:10px;"></video>
     <canvas id="canvas" style="display:none;"></canvas>
 
-    <!-- Will show masked preview during lock, and clear photo after unlock -->
     <img id="photo" alt="Photo Preview" style="display:none; margin-top: 10px;" />
   </div>
 
 <script>
 /**
  * IndexedDB storage:
- * - photoDataUrl: string (jpeg data URL)               [full-resolution]
- * - maskedPhotoDataUrl: string (jpeg data URL)         [mosaic preview]
- * - unlockAtServer: number (epoch ms, based on internet time)
- * - createdAtServer: number (epoch ms)
+ * - photoDataUrl: string (full jpeg data URL)
+ * - maskedPhotoDataUrl: string (mosaic jpeg data URL)
+ * - localUnlockAt: number (epoch ms, local clock-based)
+ * - serverUnlockAt: number (epoch ms, server-validated target; set after successful sync)
+ * - createdAtLocal: number (epoch ms)
+ * - createdAtServer: number (epoch ms | null)
  *
- * Time sync:
- * - offsetMs: serverNowMs - Date.now()
- * - lastSyncLocalMs: Date.now() when we last successfully synced
- *
- * Fail-safe: if time sync is stale/offline, countdown pauses and unlock cannot occur.
- * During lock (including paused), show maskedPhotoDataUrl if available.
+ * Behavior:
+ * - Countdown uses local clock by default (no delay on Start Camera).
+ * - Every 1 minute, background tries to fetch server time and compute offset + serverUnlockAt.
+ * - Unlock decision uses server time when available & healthy; otherwise local countdown continues.
+ * - Only if 3 consecutive sync failures occur => pause (fail-safe), keeping masked preview.
  */
 
-const dbName = "time_lock_db_v6";
+const dbName = "time_lock_db_v7";
 const storeName = "kv";
 
 function openDB() {
@@ -131,7 +130,7 @@ async function idbDel(key) {
   });
 }
 
-// UI elements
+// UI
 const $ = (id) => document.getElementById(id);
 const video = $("video");
 const canvas = $("canvas");
@@ -146,21 +145,20 @@ const switchBtn = $("switch");
 const hoursSel = $("hours");
 const minsSel = $("mins");
 
-// Preset buttons
 const presetButtons = Array.from(document.querySelectorAll("button[data-preset-min]"));
 
 let stream = null;
-
-// Camera selection state
 let desiredFacing = "environment";
 let deviceMap = { user: null, environment: null };
 
 // Time sync state
-let offsetMs = null;
+let offsetMs = null;             // serverNow - localNow (computed on successful sync)
 let lastSyncLocalMs = 0;
-let lastServerNowEstimateMs = 0;
-let frozenRemainingMs = null;
 let lastTimeSource = "";
+let consecutiveSyncFailures = 0;
+
+let frozenRemainingMs = null;    // when paused after 3 failures
+let pauseDueToNetwork = false;
 
 // Tunables
 const TIME_URLS = [
@@ -168,12 +166,14 @@ const TIME_URLS = [
   "https://worldtimeapi.org/api/ip",
   "https://worldtimeapi.org/api/timezone/Etc/UTC"
 ];
-const SYNC_INTERVAL_MS = 20000;
-const MAX_SYNC_AGE_MS = 60000;
 const FETCH_TIMEOUT_MS = 4000;
 
-// Mask tuning (bigger = stronger mosaic)
-const MOSAIC_BLOCK_PX = 26;  // try 20–40 depending on how “unreadable” you want it
+// New behavior knobs
+const SYNC_EVERY_MS = 60000;          // check server time every 1 minute
+const FAIL_RETRY_THRESHOLD = 3;       // pause after 3 consecutive failures
+
+// Mask tuning
+const MOSAIC_BLOCK_PX = 26;
 
 let renderTimer = null;
 let syncTimer = null;
@@ -236,23 +236,57 @@ function buildDelayMs() {
 }
 
 async function getStored() {
-  const unlockAtServer = await idbGet("unlockAtServer");
-  const photoDataUrl = await idbGet("photoDataUrl");
-  const maskedPhotoDataUrl = await idbGet("maskedPhotoDataUrl");
-  const createdAtServer = await idbGet("createdAtServer");
-  return { unlockAtServer, photoDataUrl, maskedPhotoDataUrl, createdAtServer };
+  return {
+    photoDataUrl: await idbGet("photoDataUrl"),
+    maskedPhotoDataUrl: await idbGet("maskedPhotoDataUrl"),
+    localUnlockAt: await idbGet("localUnlockAt"),
+    serverUnlockAt: await idbGet("serverUnlockAt"),
+    createdAtLocal: await idbGet("createdAtLocal"),
+    createdAtServer: await idbGet("createdAtServer")
+  };
 }
 
-// ---- Time sync ----
+// ---- Mosaic mask ----
 
-function isTimeFresh() {
-  return (offsetMs !== null) && (Date.now() - lastSyncLocalMs <= MAX_SYNC_AGE_MS);
+function loadImageFromDataUrl(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = reject;
+    im.src = dataUrl;
+  });
 }
 
-function estimatedServerNowMs() {
-  if (offsetMs === null) return null;
-  return Date.now() + offsetMs;
+async function createMosaicPreviewDataUrl(fullDataUrl) {
+  const im = await loadImageFromDataUrl(fullDataUrl);
+  const w = im.naturalWidth || im.width;
+  const h = im.naturalHeight || im.height;
+
+  const scaleW = Math.max(1, Math.floor(w / MOSAIC_BLOCK_PX));
+  const scaleH = Math.max(1, Math.floor(h / MOSAIC_BLOCK_PX));
+
+  const small = document.createElement("canvas");
+  small.width = scaleW;
+  small.height = scaleH;
+
+  const smallCtx = small.getContext("2d");
+  smallCtx.imageSmoothingEnabled = true;
+  smallCtx.drawImage(im, 0, 0, scaleW, scaleH);
+
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+
+  const outCtx = out.getContext("2d");
+  try { outCtx.filter = "blur(1.2px)"; } catch (_) {}
+  outCtx.imageSmoothingEnabled = false;
+  outCtx.drawImage(small, 0, 0, scaleW, scaleH, 0, 0, w, h);
+  try { outCtx.filter = "none"; } catch (_) {}
+
+  return out.toDataURL("image/jpeg", 0.80);
 }
+
+// ---- Time sync: background only ----
 
 async function fetchWithTimeout(url, timeoutMs) {
   const controller = new AbortController();
@@ -266,7 +300,26 @@ async function fetchWithTimeout(url, timeoutMs) {
   }
 }
 
-async function syncTime() {
+function estimatedServerNowMs() {
+  if (offsetMs === null) return null;
+  return Date.now() + offsetMs;
+}
+
+function updateTimePill() {
+  if (pauseDueToNetwork) {
+    setTimePill("Time: cannot verify (3 failures) — paused", "warn");
+    return;
+  }
+  if (offsetMs === null) {
+    setTimePill("Time: not verified yet (local timer running)", "warn");
+    return;
+  }
+  const ageSec = Math.round((Date.now() - lastSyncLocalMs) / 1000);
+  const host = lastTimeSource ? new URL(lastTimeSource).host : "time service";
+  setTimePill(`Time: last verified via ${host} (${ageSec}s ago)`, "muted");
+}
+
+async function backgroundSyncTimeOnce() {
   for (const url of TIME_URLS) {
     const t0 = Date.now();
     try {
@@ -296,70 +349,42 @@ async function syncTime() {
       lastSyncLocalMs = Date.now();
       lastTimeSource = url;
 
+      consecutiveSyncFailures = 0;
+      pauseDueToNetwork = false;
       frozenRemainingMs = null;
+
+      // If we already have a local unlock target, translate it to server unlock target for stronger unlock gating
+      const localUnlockAt = await idbGet("localUnlockAt");
+      const createdAtLocal = await idbGet("createdAtLocal");
+      if (localUnlockAt && createdAtLocal) {
+        const delayMs = localUnlockAt - createdAtLocal;
+        const serverNowEst = estimatedServerNowMs();
+        const createdAtServer = serverNowEst - (Date.now() - createdAtLocal); // approximate mapping
+        const serverUnlockAt = createdAtServer + delayMs;
+
+        await idbSet("createdAtServer", createdAtServer);
+        await idbSet("serverUnlockAt", serverUnlockAt);
+      }
+
+      updateTimePill();
       return true;
     } catch (e) {
       // try next provider
     }
   }
-  return false;
-}
 
-function updateTimePill() {
-  if (isTimeFresh()) {
-    const age = Date.now() - lastSyncLocalMs;
-    const host = lastTimeSource ? new URL(lastTimeSource).host : "time service";
-    setTimePill(`Time: verified via ${host} (${Math.round(age/1000)}s ago)`, "muted");
-  } else {
-    setTimePill("Time: not verified (offline) — paused", "warn");
+  consecutiveSyncFailures += 1;
+  if (consecutiveSyncFailures >= FAIL_RETRY_THRESHOLD) {
+    pauseDueToNetwork = true;
+    // Freeze remaining time based on local countdown at the moment we decide to pause
+    const localUnlockAt = await idbGet("localUnlockAt");
+    if (localUnlockAt) {
+      frozenRemainingMs = localUnlockAt - Date.now();
+      if (frozenRemainingMs < 0) frozenRemainingMs = 0;
+    }
   }
-}
-
-// ---- Mask generation (mosaic) ----
-
-function loadImageFromDataUrl(dataUrl) {
-  return new Promise((resolve, reject) => {
-    const im = new Image();
-    im.onload = () => resolve(im);
-    im.onerror = reject;
-    im.src = dataUrl;
-  });
-}
-
-async function createMosaicPreviewDataUrl(fullDataUrl) {
-  const im = await loadImageFromDataUrl(fullDataUrl);
-
-  const w = im.naturalWidth || im.width;
-  const h = im.naturalHeight || im.height;
-
-  // Downscale to create pixel blocks, then upscale without smoothing.
-  const scaleW = Math.max(1, Math.floor(w / MOSAIC_BLOCK_PX));
-  const scaleH = Math.max(1, Math.floor(h / MOSAIC_BLOCK_PX));
-
-  const small = document.createElement("canvas");
-  small.width = scaleW;
-  small.height = scaleH;
-
-  const smallCtx = small.getContext("2d");
-  smallCtx.imageSmoothingEnabled = true;
-  // Draw into tiny canvas (averaging)
-  smallCtx.drawImage(im, 0, 0, scaleW, scaleH);
-
-  const out = document.createElement("canvas");
-  out.width = w;
-  out.height = h;
-
-  const outCtx = out.getContext("2d");
-  // Optional slight blur (supported in modern Safari; if not, it will just ignore)
-  try { outCtx.filter = "blur(1.2px)"; } catch (_) {}
-  outCtx.imageSmoothingEnabled = false;
-  // Upscale (pixelated)
-  outCtx.drawImage(small, 0, 0, scaleW, scaleH, 0, 0, w, h);
-
-  // Reset filter to avoid affecting later draws
-  try { outCtx.filter = "none"; } catch (_) {}
-
-  return out.toDataURL("image/jpeg", 0.80);
+  updateTimePill();
+  return false;
 }
 
 // ---- Camera helpers ----
@@ -433,14 +458,8 @@ async function startCameraWithFacing(facing) {
 }
 
 async function startCamera() {
-  // User-gesture sync (more reliable on iOS PWA than background-only sync)
-  await syncTime();
+  // Per your request: DO NOT do server time check here
   updateTimePill();
-
-  if (!isTimeFresh()) {
-    setStatus("Internet time is not verified. Please reconnect (Wi-Fi/cellular) and try again. Countdown stays paused until time sync succeeds.");
-    return;
-  }
   await startCameraWithFacing(desiredFacing);
 }
 
@@ -449,38 +468,27 @@ async function switchCamera() {
   await startCameraWithFacing(next);
 }
 
-// ---- Main render loop ----
+// ---- Render ----
 
 async function render() {
-  const { unlockAtServer, photoDataUrl, maskedPhotoDataUrl, createdAtServer } = await getStored();
+  const { photoDataUrl, maskedPhotoDataUrl, localUnlockAt, serverUnlockAt, createdAtLocal, createdAtServer } = await getStored();
 
   updateTimePill();
 
-  if (isTimeFresh()) {
-    const est = estimatedServerNowMs();
-    if (est !== null) lastServerNowEstimateMs = est;
-  }
-
-  // No stored photo
-  if (!unlockAtServer || !photoDataUrl) {
+  if (!localUnlockAt || !photoDataUrl) {
     img.style.display = "none";
     img.classList.remove("maskedPreview");
     countdownEl.textContent = "--:--:--";
     setLockPill("No photo stored", "muted");
-    setStatus(isTimeFresh()
-      ? "Ready. Choose delay, start camera, take photo."
-      : "Offline. This app requires internet time verification. Countdown (if any) will pause until verified."
-    );
+    setStatus("Ready. Start camera and take a photo. Timer starts immediately using local clock.");
     return;
   }
 
-  const fresh = isTimeFresh();
+  // Determine remaining time
+  let msLeft = localUnlockAt - Date.now();
 
-  // If offline/stale => paused; show masked preview and freeze countdown
-  if (!fresh) {
+  if (pauseDueToNetwork) {
     setLockPill("Locked (Paused)", "danger");
-
-    // Always show masked preview during lock period (including paused)
     if (maskedPhotoDataUrl) {
       img.src = maskedPhotoDataUrl;
       img.style.display = "block";
@@ -491,28 +499,21 @@ async function render() {
     }
 
     if (frozenRemainingMs === null) {
-      const base = lastServerNowEstimateMs || (unlockAtServer - 1);
-      frozenRemainingMs = unlockAtServer - base;
+      frozenRemainingMs = msLeft;
       if (frozenRemainingMs < 0) frozenRemainingMs = 0;
     }
     countdownEl.textContent = formatDuration(frozenRemainingMs);
 
-    const unlockStr = new Date(unlockAtServer).toLocaleString();
-    const createdStr = createdAtServer ? new Date(createdAtServer).toLocaleString() : "—";
-    setStatus(`Photo is locked but time cannot be verified (offline). Countdown is paused. Created (server time): ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
+    setStatus("Paused after 3 consecutive server time check failures. Reconnect to resume verification.");
     return;
   }
 
-  // Fresh time: countdown runs using estimated server time
-  const serverNow = estimatedServerNowMs();
-  const msLeft = unlockAtServer - serverNow;
-
+  // Not paused: countdown continues even if server time not available
+  countdownEl.textContent = formatDuration(msLeft);
   if (msLeft > 0) {
     setLockPill("Locked", "danger");
-    frozenRemainingMs = null;
-    countdownEl.textContent = formatDuration(msLeft);
 
-    // Always show masked preview during lock period
+    // Always show masked preview during lock
     if (maskedPhotoDataUrl) {
       img.src = maskedPhotoDataUrl;
       img.style.display = "block";
@@ -522,34 +523,55 @@ async function render() {
       img.classList.remove("maskedPreview");
     }
 
-    const unlockStr = new Date(unlockAtServer).toLocaleString();
-    const createdStr = createdAtServer ? new Date(createdAtServer).toLocaleString() : "—";
-    setStatus(`Photo is locked. Masked preview shown. Created (server time): ${createdStr}. Unlocks at (server time): ${unlockStr}.`);
+    // If we have server unlock target and server time estimate, we can show a more accurate status text
+    if (serverUnlockAt && offsetMs !== null) {
+      const serverNow = estimatedServerNowMs();
+      const serverLeft = serverUnlockAt - serverNow;
+      const unlockStr = new Date(serverUnlockAt).toLocaleString();
+      setStatus(`Locked. Masked preview shown. Server-validated unlock target: ${unlockStr}. (Server remaining: ${formatDuration(serverLeft)})`);
+    } else {
+      const unlockStrLocal = new Date(localUnlockAt).toLocaleString();
+      setStatus(`Locked. Masked preview shown. Local unlock target: ${unlockStrLocal}. (Server verification runs every 1 min.)`);
+    }
   } else {
-    // Unlocked (only allowed when time is verified)
+    // Local time elapsed. Only show the real photo if server verification says it's okay OR we haven't verified yet?
+    // Your earlier model: server verification matters. This implementation:
+    // - If we have serverUnlockAt + server time => require server elapsed.
+    // - If we haven't verified yet => allow unlock by local timer (prototype convenience).
+    if (serverUnlockAt && offsetMs !== null) {
+      const serverNow = estimatedServerNowMs();
+      if (serverNow < serverUnlockAt) {
+        // Local says done, server says not yet: keep locked (show masked), show message.
+        setLockPill("Locked", "danger");
+        if (maskedPhotoDataUrl) {
+          img.src = maskedPhotoDataUrl;
+          img.style.display = "block";
+          img.classList.add("maskedPreview");
+        } else {
+          img.style.display = "none";
+          img.classList.remove("maskedPreview");
+        }
+        countdownEl.textContent = "00:00:00";
+        setStatus("Local timer elapsed, but server time has not yet reached unlock. Waiting for server verification.");
+        return;
+      }
+    }
+
+    // Unlocked
+    setLockPill("Unlocked", "ok");
+    countdownEl.textContent = "00:00:00";
     img.src = photoDataUrl;
     img.style.display = "block";
     img.classList.remove("maskedPreview");
 
-    frozenRemainingMs = null;
-    countdownEl.textContent = "00:00:00";
-    setLockPill("Unlocked", "ok");
-
-    const unlockStr = new Date(unlockAtServer).toLocaleString();
-    setStatus(`Unlocked (time verified). Unlock time (server time): ${unlockStr}.`);
+    const unlockStr = serverUnlockAt ? new Date(serverUnlockAt).toLocaleString() : new Date(localUnlockAt).toLocaleString();
+    setStatus(`Unlocked. (Target: ${unlockStr})`);
   }
 }
 
 // ---- Actions ----
 
 async function takePhoto() {
-  await syncTime();
-  updateTimePill();
-
-  if (!isTimeFresh()) {
-    setStatus("Cannot take/lock a photo while offline. Reconnect to the internet so time can be verified.");
-    return;
-  }
   if (!stream) return;
 
   const delayMs = buildDelayMs();
@@ -557,6 +579,9 @@ async function takePhoto() {
     setStatus("Delay must be at least 1 minute (or set a non-zero value).");
     return;
   }
+
+  const nowLocal = Date.now();
+  const localUnlockAt = nowLocal + delayMs;
 
   // Capture frame
   const w = video.videoWidth || 1280;
@@ -568,35 +593,53 @@ async function takePhoto() {
 
   const fullDataUrl = canvas.toDataURL("image/jpeg", 0.92);
 
-  // Create masked preview (mosaic) so user can confirm photo without reading details
   let maskedDataUrl = null;
   try {
     maskedDataUrl = await createMosaicPreviewDataUrl(fullDataUrl);
-  } catch (e) {
-    // If masking fails for any reason, fall back to showing nothing during lock
+  } catch (_) {
     maskedDataUrl = null;
   }
 
-  // Use server time estimate for lock start
-  const serverNow = estimatedServerNowMs();
-  const unlockAtServer = serverNow + delayMs;
-
+  // Store local schedule immediately
   await idbSet("photoDataUrl", fullDataUrl);
   await idbSet("maskedPhotoDataUrl", maskedDataUrl);
-  await idbSet("createdAtServer", serverNow);
-  await idbSet("unlockAtServer", unlockAtServer);
+  await idbSet("createdAtLocal", nowLocal);
+  await idbSet("localUnlockAt", localUnlockAt);
+
+  // Reset server-verified values; background sync will fill them later
+  await idbSet("createdAtServer", null);
+  await idbSet("serverUnlockAt", null);
+
+  // Reset pause/failure state
+  consecutiveSyncFailures = 0;
+  pauseDueToNetwork = false;
+  frozenRemainingMs = null;
 
   stopCameraIfRunning();
+
+  // Kick an immediate background sync attempt (non-blocking UI: do not await)
+  backgroundSyncTimeOnce().finally(() => { /* no-op */ });
+
   await render();
 }
 
 async function clearAll() {
   await idbDel("photoDataUrl");
   await idbDel("maskedPhotoDataUrl");
-  await idbDel("unlockAtServer");
+  await idbDel("localUnlockAt");
+  await idbDel("serverUnlockAt");
+  await idbDel("createdAtLocal");
   await idbDel("createdAtServer");
+
   stopCameraIfRunning();
+
+  offsetMs = null;
+  lastSyncLocalMs = 0;
+  lastTimeSource = "";
+  consecutiveSyncFailures = 0;
+  pauseDueToNetwork = false;
   frozenRemainingMs = null;
+
   await render();
 }
 
@@ -623,26 +666,21 @@ $("clear").addEventListener("click", clearAll);
   populateTimeDropdowns();
   setDelayFromMinutes(60);
 
-  setTimePill("Time: checking…", "warn");
-
-  // Initial sync attempt (best-effort; real gating happens on Start/Take)
-  await syncTime();
-  updateTimePill();
-
-  if (syncTimer) clearInterval(syncTimer);
-  syncTimer = setInterval(async () => {
-    await syncTime();
-    updateTimePill();
-  }, SYNC_INTERVAL_MS);
-
+  // UI refresh loop
   if (renderTimer) clearInterval(renderTimer);
   renderTimer = setInterval(render, 1000);
   await render();
 
-  document.addEventListener("visibilitychange", async () => {
+  // Background sync every 1 minute (best-effort). Does NOT block camera use.
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = setInterval(() => {
+    backgroundSyncTimeOnce().finally(() => { /* no-op */ });
+  }, SYNC_EVERY_MS);
+
+  // On resume, attempt a background sync (non-blocking)
+  document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
-      await syncTime();
-      await render();
+      backgroundSyncTimeOnce().finally(() => { /* no-op */ });
     }
   });
 
