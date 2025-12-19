@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Time-Locked Camera</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    video, img { width: 100%; max-width: 520px; border-radius: 12px; background: #eee; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; margin: 6px 6px 6px 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .muted { color: #666; }
+    .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin-top: 12px; max-width: 540px; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h2>Time-Locked Camera (Prototype)</h2>
+  <p class="muted">Takes a picture and hides it until a preset delay elapses.</p>
+
+  <div class="card">
+    <div class="row">
+      <label>Delay:</label>
+      <select id="delay">
+        <option value="3600000" selected>1 hour</option>
+        <option value="60000">1 minute (test)</option>
+        <option value="300000">5 minutes</option>
+      </select>
+      <button id="start">Start Camera</button>
+      <button id="snap" disabled>Take Photo</button>
+      <button id="clear">Clear Stored Photo</button>
+    </div>
+
+    <p id="status" class="muted"></p>
+
+    <video id="video" playsinline autoplay muted style="display:none;"></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+    <img id="lockedPreview" alt="Locked/Unlocked Photo" style="display:none; margin-top: 10px;" />
+  </div>
+
+<script>
+  // Minimal IndexedDB helper
+  const dbName = "time_lock_db";
+  const storeName = "photos";
+
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        db.createObjectStore(storeName);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbSet(key, val) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).put(val, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readonly");
+      const req = tx.objectStore(storeName).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbDel(key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  const el = (id) => document.getElementById(id);
+  const video = el("video");
+  const canvas = el("canvas");
+  const img = el("lockedPreview");
+  const statusEl = el("status");
+
+  let stream = null;
+  let ticker = null;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  async function loadStateAndRender() {
+    const unlockAt = await idbGet("unlockAt");
+    const dataUrl = await idbGet("photoDataUrl");
+
+    if (!unlockAt || !dataUrl) {
+      img.style.display = "none";
+      setStatus("No stored photo. Take one to start the lock.");
+      return;
+    }
+
+    const now = Date.now();
+    if (now < unlockAt) {
+      const msLeft = unlockAt - now;
+      const mins = Math.ceil(msLeft / 60000);
+      img.style.display = "none";
+      setStatus(`Photo locked. Remaining: ~${mins} minute(s). (Unlock at: ${new Date(unlockAt).toLocaleString()})`);
+    } else {
+      img.src = dataUrl;
+      img.style.display = "block";
+      setStatus(`Unlocked. (Unlocked at: ${new Date(unlockAt).toLocaleString()})`);
+    }
+  }
+
+  async function startCamera() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false
+      });
+      video.srcObject = stream;
+      video.style.display = "block";
+      el("snap").disabled = false;
+      setStatus("Camera started. Tap 'Take Photo'.");
+    } catch (e) {
+      setStatus("Camera permission denied or unavailable. On iPhone: must be served over HTTPS and use Safari.");
+      console.error(e);
+    }
+  }
+
+  async function takePhoto() {
+    if (!stream) return;
+    const delayMs = Number(el("delay").value);
+
+    // Draw current frame to canvas
+    const w = video.videoWidth || 1280;
+    const h = video.videoHeight || 720;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, w, h);
+
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+    const unlockAt = Date.now() + delayMs;
+
+    await idbSet("photoDataUrl", dataUrl);
+    await idbSet("unlockAt", unlockAt);
+
+    // Stop camera (optional)
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.style.display = "none";
+    el("snap").disabled = true;
+
+    await loadStateAndRender();
+  }
+
+  async function clearAll() {
+    await idbDel("photoDataUrl");
+    await idbDel("unlockAt");
+    img.style.display = "none";
+    setStatus("Cleared.");
+  }
+
+  el("start").addEventListener("click", startCamera);
+  el("snap").addEventListener("click", takePhoto);
+  el("clear").addEventListener("click", clearAll);
+
+  // Periodically refresh lock status
+  (async () => {
+    await loadStateAndRender();
+    ticker = setInterval(loadStateAndRender, 5000);
+  })();
+</script>
+</body>
+</html>
